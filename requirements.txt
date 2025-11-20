@@ -1,7 +1,15 @@
 pandas
 numpy
 matplotlib
-plotly
 backtrader
 jupyter
 scikit-learn
+pandas-ta
+pandas
+pandas-datareader
+ipykernel
+statsmodels
+pyportfolioopt
+requests
+certifi
+yfinance
