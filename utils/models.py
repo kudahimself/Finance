@@ -12,7 +12,39 @@ from pypfopt.risk_models import CovarianceShrinkage
 from pypfopt.efficient_frontier import EfficientFrontier
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit, RandomizedSearchCV, train_test_split
+import traceback
+import warnings
+from typing import Optional, List, Tuple
+
+
+def _safe_xgb_fit(model, X, y, eval_set: Optional[List[Tuple]] = None, early_stopping_rounds: int = 30, verbose: bool = False):
+    """Fit an XGB model using early stopping when supported; fall back gracefully.
+
+    Some XGBoost versions/wrappers do not accept `early_stopping_rounds` in
+    the scikit-learn API. This helper tries the common signatures and falls
+    back to fitting without early stopping if necessary.
+    """
+    try:
+        # Try the modern sklearn API signature with early stopping
+        if eval_set is not None:
+            model.fit(X, y, eval_set=eval_set, early_stopping_rounds=early_stopping_rounds, verbose=verbose)
+        else:
+            model.fit(X, y, early_stopping_rounds=early_stopping_rounds, verbose=verbose)
+        return model
+    except TypeError:
+        try:
+            # Some versions don't accept early_stopping_rounds; try without it but with eval_set
+            if eval_set is not None:
+                model.fit(X, y, eval_set=eval_set, verbose=verbose)
+            else:
+                model.fit(X, y, verbose=verbose)
+            return model
+        except Exception:
+            # Last resort: plain fit
+            model.fit(X, y)
+            return model
+
 
 
 
@@ -20,7 +52,7 @@ def rolling_train_predict_windowed(df, features,
                                    date_col='date', ticker_col='ticker',
                                    target_col='target_1m',
                                    top_k=30, model_type='ridge',
-                                   window_months=12, min_train_rows=100,
+                                   window_months=9, min_train_rows=150,
                                    tune_model=True):
     """
     For each unique date d in the cross-section:
@@ -35,8 +67,10 @@ def rolling_train_predict_windowed(df, features,
     last_scaler = None
     dates = sorted(df[date_col].unique())
     for d in dates:
+        # Train on data strictly before the prediction date `d` to avoid lookahead.
         train_start = (pd.to_datetime(d) - pd.DateOffset(months=window_months)).normalize()
-        train_end = (pd.to_datetime(d)).normalize()
+        # Exclude rows dated == d so targets corresponding to future outcomes are not leaked into training
+        train_end = (pd.to_datetime(d) - pd.DateOffset(days=1)).normalize()
 
         train = df[(df[date_col] >= train_start) & (df[date_col] <= train_end)].dropna(subset=features + [target_col])
         if train.shape[0] < min_train_rows:
@@ -65,10 +99,50 @@ def rolling_train_predict_windowed(df, features,
             model = RandomForestRegressor(random_state=0, n_jobs=-1)
             param_grid = {'n_estimators': [100, 200], 'max_depth': [None, 6, 12]} if tune_model else None
 
-        if tune_model and param_grid is not None:
-            grid = GridSearchCV(model, param_grid, cv=3, n_jobs=-1, scoring='neg_mean_squared_error')
-            grid.fit(X_train_s, y_train)
-            model = grid.best_estimator_
+        if tune_model and model_type == 'xgboost':
+            # Simplified Strategy: RandomizedSearch WITHOUT Early Stopping
+            # Uses tree_method='hist' for speed and RandomizedSearchCV for efficient tuning.
+            # This avoids API conflicts with early_stopping_rounds while still optimizing parameters.
+            
+            xgb_base = XGBRegressor(random_state=0, n_jobs=-1, verbosity=0, tree_method='hist')
+            
+            # Use randomized search to find good parameters
+            rs = RandomizedSearchCV(
+                xgb_base,
+                param_distributions=param_grid,
+                n_iter=15,  # Check a reasonable number of candidates
+                cv=3,       # Standard CV
+                n_jobs=-1,
+                scoring='neg_mean_squared_error',
+                random_state=0,
+                verbose=0
+            )
+
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    rs.fit(X_train_s, y_train)
+                model = rs.best_estimator_
+            except Exception as e:
+                print(f"XGBoost RandomizedSearch failed: {e}. Falling back to defaults.")
+                model = xgb_base.set_params(n_estimators=200, learning_rate=0.05, max_depth=3)
+                model.fit(X_train_s, y_train)
+        elif tune_model and param_grid is not None:
+            # Use a time-series-aware cross-validator to avoid temporal leakage during hyperparameter tuning
+            tscv = TimeSeriesSplit(n_splits=3)
+            # Prefer RandomizedSearchCV for speed; fall back to GridSearch if small grid
+            try:
+                if sum(len(v) for v in param_grid.values()) > 12:
+                    search = RandomizedSearchCV(model, param_distributions=param_grid, n_iter=12, cv=tscv, n_jobs=-1, scoring='neg_mean_squared_error', random_state=0)
+                else:
+                    search = GridSearchCV(model, param_grid, cv=tscv, n_jobs=-1, scoring='neg_mean_squared_error')
+                search.fit(X_train_s, y_train)
+                model = search.best_estimator_
+            except Exception as e:
+                print('Hyperparameter search failed, using base estimator. Error:', e)
+                traceback.print_exc()
+                # fallback: continue with base model
+                pass
         else:
             model.fit(X_train_s, y_train)
 

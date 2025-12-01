@@ -11,6 +11,11 @@ from pypfopt.efficient_frontier import EfficientFrontier
 from pypfopt import risk_models
 from pypfopt import expected_returns
 import yfinance as yf
+import time
+import io
+import zipfile
+import re
+import os
 
 
 def download_sp500_tickers(save_local: bool) -> List[str]:
@@ -65,6 +70,7 @@ def download_sp500_tickers(save_local: bool) -> List[str]:
         print(f"An error occurred while scraping the Wikipedia page: {e}")
         print("This may be due to a network error, a change in the Wikipedia page structure, or missing dependencies.")
         return []
+
 
 def get_sp500_tickers() -> List[str]:
     """
@@ -140,43 +146,6 @@ def get_sp500_data(start_date: str = None, end_date: str = None, tickers: List[s
         return pd.DataFrame()
 
 
-def download_spy_data(save_local: bool) -> pd.DataFrame:
-    """
-    Downloads historical data for the SPY ETF from Yahoo Finance.
-
-    Parameters:
-        save_local (bool): If True, saves the data to a local CSV file.
-    """
-    spy = yf.download(tickers='SPY',
-                  auto_adjust=False,
-                    start='2022-02-01',
-                    end='2025-10-31')
-
-    spy_ret = np.log(spy['adj_close']).diff().dropna().rename({'SPY': 'SPY Buy and Hold'}, axis=1)
-    if save_local:
-        spy_ret.to_csv("data/spy_data.csv")
-
-    return spy_ret
-
-def get_spy_data() -> pd.DataFrame:
-    """
-    Reads the locally saved CSV file containing SPY historical data.
-
-    Returns:
-        A pandas DataFrame with Date index containing SPY returns.
-    """
-    try:
-        spy_ret = pd.read_csv("data/spy_data.csv", index_col=0, parse_dates=True)
-        print("Loaded SPY data from 'data/spy_data.csv'")
-        return spy_ret
-    except FileNotFoundError:
-        print("Error: 'data/spy_data.csv' not found. Please run download_spy_data() first.")
-        return pd.DataFrame()
-    except Exception as e:
-        print(f"An error occurred while reading the local SPY data file: {e}")
-        return pd.DataFrame()
-    
-    
 def download_famafrench_data(save_local: bool) -> pd.DataFrame:
     """
     Downloads the Fama-French 5-factor model data from the Ken French website.
@@ -217,49 +186,311 @@ def get_famafrench_data() -> pd.DataFrame:
     except Exception as e:
         print(f"An error occurred while reading the local Fama-French data file: {e}")
         return pd.DataFrame()
+
+
+def download_uk_famafrench_data(save_local: bool) -> pd.DataFrame:
+    """
+    Downloads the Fama-French 5-factor model data from the Ken French website.
+
+    Parameters:
+        save_local (bool): If True, saves the data to a local CSV file.
+
+    Returns:
+        A pandas DataFrame with the factor data, indexed by date.
+    """
     
-# requirements: requests, pandas, yfinance
-import requests
-import pandas as pd
-import yfinance as yf
+    # Try a few known dataset keys via pandas_datareader first (may not support country-specific names)
+    candidate_keys = [
+        'F-F_Research_Data_5_Factors_2x3',  # US (fallback)
+        'Europe_5_Factors',
+        'Europe_5_Factors_2x3',
+        'UK_5_Factors',
+        'United_Kingdom_5_Factors'
+    ]
 
-FMP_KEY = "YOUR_FMP_API_KEY"  # register and get a key
+    def _clean_and_format(df: pd.DataFrame) -> pd.DataFrame:
+        # Expect the DataFrame to have factor columns including a risk-free column 'RF' possibly
+        if 'RF' in df.columns:
+            df = df.drop('RF', axis=1)
+        df.columns = [col.strip().lower().replace(' ', '_').replace('-', '_') for col in df.columns]
+        # convert index to timestamps and monthly end frequency
+        try:
+            df.index = df.index.to_timestamp()
+        except Exception:
+            pass
+        df = df.resample('ME').last().div(100)
+        df.index.name = 'date'
+        return df
 
-def get_quarterly_eps_fmp(ticker: str, limit=40):
-    url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?period=quarter&limit={limit}&apikey={FMP_KEY}"
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    items = r.json()
-    # API returns list of quarter dicts; field names depend on provider version.
-    # Many responses include 'eps' or 'epsDiluted' — inspect returned keys.
-    rows = []
-    for it in items:
-        # fallback keys
-        eps = it.get("eps") or it.get("epsDiluted") or it.get("epsBasic") or None
-        date = it.get("date") or it.get("reportedDate")  # date of quarter end
-        if date and eps is not None:
-            rows.append({"date": pd.to_datetime(date), "eps": float(eps)})
-    return pd.DataFrame(rows).sort_values("date").set_index("date")
+    for key in candidate_keys:
+        try:
+            factor_data = web.DataReader(key, 'famafrench', start='2010')[0]
+            # Basic validation: has common factor names
+            cols_lower = [c.upper() for c in factor_data.columns]
+            if any(x in cols_lower for x in ['MKT-RF', 'MKT_RF', 'MKT']):
+                factor_data = _clean_and_format(factor_data)
+                if save_local:
+                    factor_data.to_csv("data/uk_famafrench_factors.csv")
+                print(f"Loaded Fama-French factors using key '{key}'")
+                return factor_data
+        except Exception:
+            continue
 
-def monthly_pe_from_eps(ticker: str, start: str, end: str):
-    # 1) month-end prices
-    hist = yf.download(ticker, start=start, end=end, auto_adjust=False, progress=False)
-    month_close = hist['Adj Close'].resample('M').last().rename('price')
+    # Fallback: scrape Ken French Data Library for the United Kingdom link and download
+    DATA_LIB = 'https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html'
+    try:
+        r = requests.get(DATA_LIB, timeout=15)
+        r.raise_for_status()
+        html = r.text
 
-    # 2) quarterly eps (from FMP)
-    q_eps = get_quarterly_eps_fmp(ticker)
-    if q_eps.empty:
-        return pd.DataFrame({"price": month_close, "ttm_eps": pd.NA, "pe": pd.NA})
+        # Find the first href after the 'United Kingdom' mention
+        idx = html.find('United Kingdom')
+        if idx == -1:
+            idx = html.find('United_Kingdom')
 
-    # 3) compute TTM EPS: rolling sum of last 4 quarters
-    q_eps['ttm_eps'] = q_eps['eps'].rolling(4).sum()
+        href = None
+        if idx != -1:
+            # search forward for href
+            m = re.search(r'href\s*=\s*"([^"]+\.(?:zip|csv))"', html[idx:idx+2000], re.IGNORECASE)
+            if m:
+                href = m.group(1)
 
-    # 4) expand quarterly TTM EPS to monthly index by forward-filling
-    monthly_index = month_close.index
-    # reindex quarterly ttm_eps to monthly by forward-fill
-    ttm_monthly = q_eps['ttm_eps'].reindex(monthly_index, method='ffill').rename('ttm_eps')
+        if not href:
+            # As a backup, search whole page for links containing 'United' and 'csv' or 'zip'
+            m2 = re.search(r'href\s*=\s*"([^"]*(?:united|uk|united_kingdom)[^"]*\.(?:zip|csv))"', html, re.IGNORECASE)
+            if m2:
+                href = m2.group(1)
 
-    # 5) compute P/E
-    pe = month_close / ttm_monthly
+        if not href:
+            print('Could not automatically find United Kingdom Fama-French link on Ken French page.')
+            raise RuntimeError('UK Fama-French link not found')
 
-    return pd.DataFrame({"price": month_close, "ttm_eps": ttm_monthly, "pe": pe})
+        if href.startswith('/'):
+            url = 'https://mba.tuck.dartmouth.edu' + href
+        elif href.startswith('http'):
+            url = href
+        else:
+            url = 'https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/' + href
+
+        print(f'Downloading UK Fama-French data from {url}')
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+
+        content = resp.content
+        df = None
+        if url.lower().endswith('.zip'):
+            z = zipfile.ZipFile(io.BytesIO(content))
+            # pick the first csv-like file
+            csv_names = [n for n in z.namelist() if n.lower().endswith('.csv')]
+            if not csv_names:
+                raise RuntimeError('No CSV files found inside downloaded zip')
+            with z.open(csv_names[0]) as fh:
+                try:
+                    df_raw = pd.read_csv(fh, header=0, index_col=0, parse_dates=True)
+                except Exception:
+                    fh.seek(0)
+                    df_raw = pd.read_csv(fh, header=1, index_col=0, parse_dates=True)
+        else:
+            # direct CSV
+            try:
+                df_raw = pd.read_csv(io.BytesIO(content), header=0, index_col=0, parse_dates=True)
+            except Exception:
+                df_raw = pd.read_csv(io.BytesIO(content), header=1, index_col=0, parse_dates=True)
+
+        # Try to clean common Ken French formatting where first column is year-month
+        try:
+            factor_data = _clean_and_format(df_raw)
+            if save_local:
+                factor_data.to_csv("data/uk_famafrench_factors.csv")
+            return factor_data
+        except Exception as e:
+            print('Failed to parse downloaded UK Fama-French file:', e)
+            return pd.DataFrame()
+
+    except Exception as e:
+        print(f'Failed to obtain UK Fama-French factors: {e}')
+        return pd.DataFrame()
+
+def get_uk_famafrench_data() -> pd.DataFrame:
+    try:
+        factor_data = pd.read_csv("data/uk_famafrench_factors.csv", index_col=0, parse_dates=True)
+        factor_data.index.name = 'date'
+        print("Loaded Fama-French factors from 'data/uk_famafrench_factors.csv'")
+        return factor_data
+    except FileNotFoundError:
+        print("Error: 'data/uk_famafrench_factors.csv' not found. Please run download_uk_famafrench_data() first.")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"An error occurred while reading the local Fama-French data file: {e}")
+        return pd.DataFrame()
+
+
+def download_ftse250_tickers(save_local: bool) -> List[str]:
+    """
+    Scrapes the current list of FTSE 250 constituent stock tickers from Wikipedia.
+
+    Returns:
+        A list of strings containing the FTSE 250 company tickers.
+        Returns an empty list [] if fetching or parsing fails.
+    """
+    WIKI_URL = 'https://en.wikipedia.org/wiki/FTSE_250_Index'
+    HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+
+    try:
+        response = requests.get(WIKI_URL, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        tables = pd.read_html(response.text)
+        # Find the first table with a 'Ticker' column
+        for table in tables:
+            if 'Ticker' in table.columns:
+                tickers = [str(t).strip().upper() for t in table['Ticker'] if isinstance(t, str) and t.strip()]
+                if save_local:
+                    pd.DataFrame(tickers, columns=['Ticker']).to_csv("data/ftse250_tickers.csv", index=False)
+                    print("Saved FTSE 250 tickers to 'data/ftse250_tickers.csv'")
+                print(f"Successfully retrieved {len(tickers)} FTSE 250 tickers.")
+                return tickers
+        print("Error: Could not find the 'Ticker' column in any table.")
+        return []
+    except Exception as e:
+        print(f"An error occurred while scraping the Wikipedia page: {e}")
+        return []
+
+
+
+def get_ftse250_tickers() -> List[str]:
+    """
+    Reads the locally saved CSV file containing FTSE 250 tickers.
+
+    Returns:
+        A list of strings containing the FTSE 250 company tickers.
+    """
+    try:
+        df = pd.read_csv("data/ftse250_tickers.csv")
+        tickers = df['Ticker'].tolist()
+        print(f"Loaded {len(tickers)} tickers from local file.")
+        return tickers
+    except FileNotFoundError:
+        print("Error: 'data/ftse250_tickers.csv' not found. Please run download_ftse250_tickers(save_local=True) first.")
+        return []
+    except Exception as e:
+        print(f"An error occurred while reading the local tickers file: {e}")
+        return []
+
+
+def download_ftse250_data(ftse250_list: List[str], save_local: bool) -> pd.DataFrame:
+    """
+    Downloads historical data for all FTSE 250 tickers using yfinance.
+
+    Args:
+        ftse250_list (List[str]): List of FTSE 250 tickers.
+        save_local (bool): If True, saves the data to a local CSV file.
+
+    Returns:
+        pd.DataFrame: MultiIndex DataFrame (date, ticker) with historical stock data.
+    """
+    # Robust batched download from Yahoo Finance using yfinance
+    def _to_yahoo_tickers(tickers: List[str]) -> List[str]:
+        """Convert simple FTSE tickers (e.g. 'VOD') to Yahoo format (e.g. 'VOD.L')."""
+        out = []
+        for t in tickers:
+            if not isinstance(t, str) or not t:
+                continue
+            t_up = t.strip().upper()
+            # If user already supplied a Yahoo-style ticker, keep it
+            if t_up.endswith('.L'):
+                out.append(t_up)
+            else:
+                out.append(f"{t_up}.L")
+        return out
+
+    ytickers = _to_yahoo_tickers(ftse250_list)
+
+    # Batch requests to avoid timeouts for very large lists
+    batch_size = 40
+    retry_attempts = 3
+    pause_sec = 1.0
+
+    wide_frames = []
+    parts = [ytickers[i:i+batch_size] for i in range(0, len(ytickers), batch_size)]
+
+    for i, chunk in enumerate(parts):
+        for attempt in range(1, retry_attempts + 1):
+            try:
+                print(f"Downloading batch {i+1}/{len(parts)} (tickers: {len(chunk)}) attempt {attempt}")
+                data = yf.download(
+                    tickers=chunk,
+                    start='2015-01-04',
+                    end='2025-11-01',
+                    auto_adjust=False,
+                    group_by='ticker',
+                    threads=True,
+                    progress=False
+                )
+
+                if data is None or data.empty:
+                    raise RuntimeError("Empty response from yfinance")
+
+                # Normalize MultiIndex column names to (ticker, field)
+                data.columns = pd.MultiIndex.from_tuples(
+                    [(ticker, col.strip().lower().replace(' ', '_')) for ticker, col in data.columns]
+                )
+
+                wide_frames.append(data)
+                time.sleep(pause_sec)
+                break
+            except Exception as e:
+                print(f"Batch {i+1} attempt {attempt} failed: {e}")
+                if attempt < retry_attempts:
+                    time.sleep(pause_sec * attempt)
+                else:
+                    print(f"Giving up on batch {i+1} after {retry_attempts} attempts")
+
+    if not wide_frames:
+        print('No data downloaded for FTSE 250 tickers.')
+        return pd.DataFrame()
+
+    # Concatenate along columns (tickers), align on dates
+    df_wide = pd.concat(wide_frames, axis=1)
+
+    # Save the wide MultiIndex CSV to keep compatibility with existing reader
+    if save_local and not df_wide.empty:
+        df_wide.to_csv("data/ftse250_data.csv")
+
+    # Convert to stacked format (date, ticker) like the previous implementation
+    df_wide.columns = df_wide.columns.swaplevel(0, 1)
+    df_wide = df_wide.sort_index(axis=1, level=0)
+    df = df_wide.stack()
+    df.index.names = ['date', 'ticker']
+    return df
+
+
+def get_ftse250_data(start_date: str = None, end_date: str = None, tickers: List[str] = None) -> pd.DataFrame:
+    """
+    Reads the locally saved CSV file containing FTSE 250 historical data.
+
+    Returns:
+        A pandas DataFrame with MultiIndex (Date, Ticker) containing historical stock data.
+    """
+    try:
+        df = pd.read_csv("data/ftse250_data.csv", header=[0,1], index_col=0, parse_dates=True)
+        df.columns = df.columns.swaplevel(0, 1)
+        df = df.sort_index(axis=1, level=0)
+        df = df.stack()
+        df.index.names = ['date', 'ticker']
+        print("Loaded FTSE 250 historical data from 'data/ftse250_data.csv'")
+        if (start_date is not None) and (end_date is not None):
+            print('Filtering data between', start_date, 'and', end_date)
+            df = df.loc[(df.index.get_level_values('date') >= start_date) & 
+                        (df.index.get_level_values('date') <= end_date)]
+        if tickers is not None:
+            print('Filtering data for specified tickers')
+            df = df.loc[df.index.get_level_values('ticker').isin(tickers)]
+        return df
+    except FileNotFoundError:
+        print("Error: 'data/ftse250_data.csv' not found. Please run download_ftse250_data() first.")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"An error occurred while reading the local FTSE 250 data file: {e}")
+        return pd.DataFrame()
