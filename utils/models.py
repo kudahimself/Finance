@@ -20,35 +20,6 @@ import warnings
 from typing import Optional, List, Tuple
 
 
-def _safe_xgb_fit(model, X, y, eval_set: Optional[List[Tuple]] = None, early_stopping_rounds: int = 30, verbose: bool = False):
-    """Fit an XGB model using early stopping when supported; fall back gracefully.
-
-    Some XGBoost versions/wrappers do not accept `early_stopping_rounds` in
-    the scikit-learn API. This helper tries the common signatures and falls
-    back to fitting without early stopping if necessary.
-    """
-    try:
-        # Try the modern sklearn API signature with early stopping
-        if eval_set is not None:
-            model.fit(X, y, eval_set=eval_set, early_stopping_rounds=early_stopping_rounds, verbose=verbose)
-        else:
-            model.fit(X, y, early_stopping_rounds=early_stopping_rounds, verbose=verbose)
-        return model
-    except TypeError:
-        try:
-            # Some versions don't accept early_stopping_rounds; try without it but with eval_set
-            if eval_set is not None:
-                model.fit(X, y, eval_set=eval_set, verbose=verbose)
-            else:
-                model.fit(X, y, verbose=verbose)
-            return model
-        except Exception:
-            # Last resort: plain fit
-            model.fit(X, y)
-            return model
-
-
-
 
 def rolling_train_predict_windowed(df, features,
                                    date_col='date', ticker_col='ticker',
