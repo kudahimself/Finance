@@ -6,13 +6,15 @@ from xgboost import XGBRegressor
 from sklearn.linear_model import ElasticNet
 from statsmodels.regression.rolling import RollingOLS
 import statsmodels.api as sm
-from pypfopt import risk_models
-from pypfopt import expected_returns
-from pypfopt.risk_models import CovarianceShrinkage
-from pypfopt.efficient_frontier import EfficientFrontier
 import pandas as pd
 import numpy as np
+# Halving search lives in experimental module on some sklearn versions
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit, RandomizedSearchCV, train_test_split
+try:
+    from sklearn.experimental import enable_halving_search_cv  # noqa: F401
+    from sklearn.model_selection import HalvingRandomSearchCV
+except Exception:
+    HalvingRandomSearchCV = None
 import traceback
 import warnings
 from typing import Optional, List, Tuple
@@ -127,15 +129,30 @@ def rolling_train_predict_windowed(df, features,
                 print(f"XGBoost RandomizedSearch failed: {e}. Falling back to defaults.")
                 model = xgb_base.set_params(n_estimators=200, learning_rate=0.05, max_depth=3)
                 model.fit(X_train_s, y_train)
+
         elif tune_model and param_grid is not None:
             # Use a time-series-aware cross-validator to avoid temporal leakage during hyperparameter tuning
             tscv = TimeSeriesSplit(n_splits=3)
             # Prefer RandomizedSearchCV for speed; fall back to GridSearch if small grid
             try:
                 if sum(len(v) for v in param_grid.values()) > 12:
-                    search = RandomizedSearchCV(model, param_distributions=param_grid, n_iter=12, cv=tscv, n_jobs=-1, scoring='neg_mean_squared_error', random_state=0)
+                    search = RandomizedSearchCV(
+                        model, 
+                        param_distributions=param_grid, 
+                        n_iter=12, 
+                        cv=tscv, 
+                        n_jobs=-1, 
+                        scoring='neg_mean_squared_error', 
+                        random_state=0  # ✅ Added random_state for reproducibility
+                    )
                 else:
-                    search = GridSearchCV(model, param_grid, cv=tscv, n_jobs=-1, scoring='neg_mean_squared_error')
+                    search = GridSearchCV(
+                        model, 
+                        param_grid, 
+                        cv=tscv, 
+                        n_jobs=-1, 
+                        scoring='neg_mean_squared_error'
+                    )
                 search.fit(X_train_s, y_train)
                 model = search.best_estimator_
             except Exception as e:
@@ -145,7 +162,7 @@ def rolling_train_predict_windowed(df, features,
                 pass
         else:
             model.fit(X_train_s, y_train)
-
+            
         last_model = model
         last_scaler = scaler
 
