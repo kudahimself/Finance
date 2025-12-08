@@ -43,7 +43,8 @@ def download_sp500_tickers(save_local: bool) -> List[str]:
         response = requests.get(WIKI_URL, headers=HEADERS, timeout=10)
         response.raise_for_status() # Raise an exception for HTTP errors (like 403)
         tables = pd.read_html(response.text)
-        sp500_table = tables[1]
+        [print(table) for table in tables]
+        sp500_table = tables[0]
         
         if 'Symbol' in sp500_table.columns:
             # 4. Extract and clean the tickers
@@ -93,8 +94,8 @@ def get_sp500_tickers() -> List[str]:
 
 def download_sp500_data(sp500_list: List[str], save_local: bool) -> pd.DataFrame:
     
-    # Download historical data for all tickers from 2016-01-01
-    data = yf.download(tickers=sp500_list, start='2015-01-04', end='2025-11-01', auto_adjust=False, group_by='ticker', threads=True)
+    # Download historical data for all tickers from 2010-01-04
+    data = yf.download(tickers=sp500_list, start='2010-01-04', end='2025-11-01', auto_adjust=False, group_by='ticker', threads=True)
 
     if not data.empty:
         print('Data fetched successfully for S&P 500 tickers!')
